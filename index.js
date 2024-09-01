@@ -2,18 +2,15 @@ import express from "express";
 import cors from "cors";
 import path from "path";
 import url, { fileURLToPath } from "url";
+import dotenv from "dotenv";
 import ImageKit from "imagekit";
 import mongoose from "mongoose";
 import Chat from "./models/chat.js";
 import UserChats from "./models/userChats.js";
 import { ClerkExpressRequireAuth } from "@clerk/clerk-sdk-node";
 
-
-import dotenv from 'dotenv';
-
-dotenv.config()
-
-//  --env-file .env
+// Load environment variables from .env file
+dotenv.config();
 
 const port = process.env.PORT || 3000;
 const app = express();
@@ -23,26 +20,51 @@ const __dirname = path.dirname(__filename);
 
 app.use(
   cors({
-    origin: process.env.CLIENT_URL,
+    origin: process.env.CLIENT_URL || "*", // Change to a specific origin in production
     credentials: true,
   })
 );
 
 app.use(express.json());
 
+// MongoDB Connection
 const connect = async () => {
   try {
     await mongoose.connect(process.env.MONGO);
     console.log("Connected to MongoDB");
   } catch (err) {
-    console.log(err);
+    console.error("MongoDB connection error:", err);
+    process.exit(1); // Exit process if MongoDB connection fails
   }
 };
+
+mongoose.connection.on("connected", () => {
+  console.log("MongoDB connected");
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
+});
+
+mongoose.connection.on("error", (err) => {
+  console.error("MongoDB connection error:", err);
+  process.exit(1); // Exit process on MongoDB connection error
+});
+
+connect();
+
+// Ensure environment variables are loaded correctly
+if (!process.env.IMAGE_KIT_ENDPOINT || !process.env.IMAGE_KIT_PUBLIC_KEY || !process.env.IMAGE_KIT_PRIVATE_KEY) {
+  throw new Error('Missing ImageKit configuration');
+}
 
 const imagekit = new ImageKit({
   urlEndpoint: process.env.IMAGE_KIT_ENDPOINT,
   publicKey: process.env.IMAGE_KIT_PUBLIC_KEY,
   privateKey: process.env.IMAGE_KIT_PRIVATE_KEY,
+});
+
+app.get("/", (req, res) => {
+  res.send("Hello");
 });
 
 app.get("/api/upload", (req, res) => {
@@ -63,56 +85,41 @@ app.post("/api/chats", ClerkExpressRequireAuth(), async (req, res) => {
 
     const savedChat = await newChat.save();
 
-    // CHECK IF THE USERCHATS EXISTS
-    const userChats = await UserChats.find({ userId: userId });
-
-    // IF DOESN'T EXIST CREATE A NEW ONE AND ADD THE CHAT IN THE CHATS ARRAY
-    if (!userChats.length) {
-      const newUserChats = new UserChats({
-        userId: userId,
-        chats: [
-          {
+    // CHECK IF THE USERCHATS EXISTS AND UPDATE OR CREATE IT
+    await UserChats.findOneAndUpdate(
+      { userId: userId },
+      {
+        $push: {
+          chats: {
             _id: savedChat._id,
             title: text.substring(0, 40),
           },
-        ],
-      });
+        },
+      },
+      { new: true, upsert: true } // Creates a new document if none exists
+    );
 
-      await newUserChats.save();
-    } else {
-      // IF EXISTS, PUSH THE CHAT TO THE EXISTING ARRAY
-      await UserChats.updateOne(
-        { userId: userId }, //set it
-        {
-          $push: {
-            chats: {
-              _id: savedChat._id,
-              title: text.substring(0, 40),
-            },
-          },
-        }
-      );
-
-      res.status(201).send(newChat._id);
-    }
+    res.status(201).send(newChat._id);
   } catch (err) {
-    console.log(err);
+    console.error(err);
     res.status(500).send("Error creating chat!");
   }
 });
-app.get("/",(req,res)=>{
-  res.send("hello bot")
-})
+
 app.get("/api/userchats", ClerkExpressRequireAuth(), async (req, res) => {
   const userId = req.auth.userId;
 
   try {
-    const userChats = await UserChats.find({ userId });
+    const userChats = await UserChats.findOne({ userId });
 
-    res.status(200).send(userChats[0].chats);
+    if (userChats) {
+      res.status(200).send(userChats.chats);
+    } else {
+      res.status(404).send("No chats found for this user.");
+    }
   } catch (err) {
-    console.log(err);
-    res.status(500).send("Error fetching userchats!");
+    console.error(err);
+    res.status(500).send("Error fetching user chats!");
   }
 });
 
@@ -122,18 +129,19 @@ app.get("/api/chats/:id", ClerkExpressRequireAuth(), async (req, res) => {
   try {
     const chat = await Chat.findOne({ _id: req.params.id, userId });
 
-    res.status(200).send(chat);
+    if (chat) {
+      res.status(200).send(chat);
+    } else {
+      res.status(404).send("Chat not found!");
+    }
   } catch (err) {
-    console.log(err);
+    console.error(err);
     res.status(500).send("Error fetching chat!");
   }
 });
 
-
-//for updating my existing chats
-app.put("/api/chats/:id", ClerkExpressRequireAuth(), async (req, res) => {  //question will be user ans will be models
+app.put("/api/chats/:id", ClerkExpressRequireAuth(), async (req, res) => {
   const userId = req.auth.userId;
-
   const { question, answer, img } = req.body;
 
   const newItems = [
@@ -154,31 +162,23 @@ app.put("/api/chats/:id", ClerkExpressRequireAuth(), async (req, res) => {  //qu
         },
       }
     );
+
     res.status(200).send(updatedChat);
   } catch (err) {
-    console.log(err);
+    console.error(err);
     res.status(500).send("Error adding conversation!");
   }
 });
 
+// Error Handling Middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
-  res.status(401).send("Unauthenticated!");
+  res.status(500).send("Internal Server Error");
 });
 
-// PRODUCTION
-// app.use(express.static(path.join(__dirname, "../client/dist")));
+// Serve static files for production
+app.use(express.static(path.join(__dirname, "../client")));
 
 // app.get("*", (req, res) => {
-//   res.sendFile(path.join(__dirname, "../client/dist", "index.html"));
+//   res.sendFile(path.join(__dirname, "../client", "index.html"));
 // });
-
-app.listen(port, () => {
-  connect();
-  console.log("Server running on 3000");
-});
-
-
-
-
-
